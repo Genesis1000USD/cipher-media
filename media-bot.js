@@ -15,6 +15,8 @@ for (const key of required) {
   if (!process.env[key]) { console.error(`❌ Missing: ${key}`); process.exit(1); }
 }
 
+const HF_TOKEN = process.env.HF_TOKEN || null;
+
 // ─── CLIENTS ──────────────────────────────────────────────────
 const claude = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
@@ -41,7 +43,7 @@ function downloadBuffer(url, timeoutMs = 60000) {
       res.on("error", reject);
     });
     req.on("error", reject);
-    req.on("timeout", () => { req.destroy(); reject(new Error("Download timed out")); });
+    req.on("timeout", () => { req.destroy(); reject(new Error("Timeout")); });
   });
 }
 
@@ -49,15 +51,9 @@ function downloadBuffer(url, timeoutMs = 60000) {
 async function sendMsg(text) {
   await bot.sendMessage(CHAT_ID, text, { parse_mode: "Markdown" });
 }
-
-async function sendTyping() {
-  await bot.sendChatAction(CHAT_ID, "upload_photo");
-}
-
 async function sendPhoto(buffer, caption) {
   await bot.sendPhoto(CHAT_ID, buffer, { caption, parse_mode: "Markdown" });
 }
-
 async function sendVideo(buffer, caption) {
   try {
     await bot.sendVideo(CHAT_ID, buffer, { caption, parse_mode: "Markdown", supports_streaming: true });
@@ -67,191 +63,238 @@ async function sendVideo(buffer, caption) {
 }
 
 // ══════════════════════════════════════════════════════════════
-// IMAGE STYLES LIBRARY
+// IMAGE GENERATION — 3 PROVIDERS WITH AUTO FALLBACK
 // ══════════════════════════════════════════════════════════════
+
+// ── Provider 1: Hugging Face (best, needs free token) ─────────
+async function generateViaHuggingFace(prompt) {
+  if (!HF_TOKEN) throw new Error("No HF_TOKEN set");
+  log("Trying Hugging Face FLUX.1-schnell...");
+
+  const response = await fetch(
+    "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell",
+    {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${HF_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        inputs: prompt,
+        parameters: { num_inference_steps: 4, width: 1280, height: 720 }
+      }),
+      signal: AbortSignal.timeout(60000),
+    }
+  );
+
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`HF API error ${response.status}: ${err.substring(0, 100)}`);
+  }
+
+  const buffer = Buffer.from(await response.arrayBuffer());
+  if (buffer.length < 5000) throw new Error("HF returned empty image");
+  log(`✅ HF image ready (${buffer.length} bytes)`);
+  return buffer;
+}
+
+// ── Provider 2: Pollinations with different models ────────────
+async function generateViaPollinations(prompt, model = "flux") {
+  log(`Trying Pollinations (model: ${model})...`);
+  const encoded = encodeURIComponent(prompt);
+  const seed = Math.floor(Math.random() * 999999);
+  const url = `https://image.pollinations.ai/prompt/${encoded}?width=1280&height=720&nologo=true&seed=${seed}&model=${model}`;
+  const buffer = await downloadBuffer(url, 50000);
+  if (buffer.length < 5000) throw new Error("Pollinations returned empty image");
+  log(`✅ Pollinations image ready (${buffer.length} bytes)`);
+  return buffer;
+}
+
+// ── Provider 3: DeepAI (free, no key needed for basic) ────────
+async function generateViaDeepAI(prompt) {
+  log("Trying DeepAI...");
+  const formData = new URLSearchParams();
+  formData.append("text", prompt);
+
+  const response = await fetch("https://api.deepai.org/api/text2img", {
+    method: "POST",
+    headers: {
+      "api-key": process.env.DEEPAI_KEY || "quickstart-QUdJIGlzIGF3ZXNvbWU",
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: formData.toString(),
+    signal: AbortSignal.timeout(45000),
+  });
+
+  const data = await response.json();
+  if (!data.output_url) throw new Error("DeepAI no output URL");
+
+  const buffer = await downloadBuffer(data.output_url, 30000);
+  if (buffer.length < 5000) throw new Error("DeepAI returned empty image");
+  log(`✅ DeepAI image ready (${buffer.length} bytes)`);
+  return buffer;
+}
+
+// ── Master generator with auto-fallback ───────────────────────
+async function generateImage(prompt) {
+  const providers = [
+    { name: "Hugging Face", fn: () => generateViaHuggingFace(prompt) },
+    { name: "Pollinations (flux)", fn: () => generateViaPollinations(prompt, "flux") },
+    { name: "Pollinations (turbo)", fn: () => generateViaPollinations(prompt, "turbo") },
+    { name: "DeepAI", fn: () => generateViaDeepAI(prompt) },
+  ];
+
+  for (const provider of providers) {
+    try {
+      log(`Attempting: ${provider.name}`);
+      const buffer = await provider.fn();
+      log(`✅ Success via ${provider.name}`);
+      return buffer;
+    } catch (err) {
+      log(`⚠️ ${provider.name} failed: ${err.message}`);
+    }
+  }
+
+  throw new Error("All image providers failed. Please try again in a few minutes.");
+}
+
+// ══════════════════════════════════════════════════════════════
+// STYLE LIBRARY
+// ══════════════════════════════════════════════════════════════
+
+const BASE = "no text no words no letters no numbers no watermarks, dark aesthetic, gold #c9a84c and deep purple #7c3aed color palette, void black background, cinematic mysterious photorealistic 8k ultra detailed";
 
 const STYLES = {
   cipher_brand: {
     label: "🔮 CIPHER Brand Art",
     prompts: [
-      "mysterious hooded oracle figure glowing golden eyes void background ancient crypto symbols floating",
-      "dark cyberpunk prophet silhouette surrounded by blockchain data streams gold purple neon",
-      "ethereal digital oracle hands outstretched blockchain networks glowing dark cosmic void",
-      "cipher symbol glowing gold surrounded by market data streams dark mystical atmosphere",
-      "lone figure standing before massive glowing blockchain network dark apocalyptic sky gold light",
+      `mysterious hooded oracle figure glowing golden eyes cosmic void ancient crypto symbols floating dark atmosphere, ${BASE}`,
+      `dark cyberpunk prophet silhouette surrounded by blockchain data streams gold purple neon void, ${BASE}`,
+      `ethereal digital oracle hands outstretched blockchain networks glowing dark cosmic void dramatic, ${BASE}`,
+      `lone figure standing before massive glowing blockchain network dark apocalyptic sky gold light, ${BASE}`,
     ]
   },
   crypto_market: {
     label: "📊 Crypto Market Visual",
     prompts: [
-      "dark holographic Bitcoin price chart glowing gold candlesticks ascending black void",
-      "cryptocurrency market visualization glowing data streams multiple coins dark neon atmosphere",
-      "Bitcoin gold coin shattering upward explosion dark background digital art cinematic",
-      "crypto trading terminal dark cyberpunk multiple screens glowing charts real time data",
-      "blockchain network visualization glowing nodes connections deep space purple gold",
+      `dark holographic Bitcoin price chart glowing gold candlesticks ascending black void cinematic, ${BASE}`,
+      `cryptocurrency market visualization glowing data streams multiple coins dark neon atmosphere, ${BASE}`,
+      `Bitcoin gold coin shattering upward explosion dark background digital art cinematic dramatic, ${BASE}`,
+      `blockchain network deep space visualization glowing nodes connections purple gold, ${BASE}`,
     ]
   },
   breaking_news: {
     label: "🚨 Breaking News Graphic",
     prompts: [
-      "urgent breaking news dark background red gold warning signals crypto market explosion",
-      "dramatic breaking alert graphic dark stormy atmosphere lightning glowing text market crash",
-      "urgent signal flare dark background market alert dramatic cinematic atmosphere",
-      "breaking market event shattered charts explosion dramatic dark red gold atmosphere",
-      "crypto market emergency signal dark command center multiple screens alert red warning",
+      `urgent breaking alert dark stormy atmosphere lightning market crash signals dramatic cinematic, ${BASE}`,
+      `dramatic breaking dark red gold warning signals crypto market explosion urgent, ${BASE}`,
+      `crypto market emergency signal dark command center multiple screens alert red warning, ${BASE}`,
     ]
   },
   price_animation: {
     label: "📈 Price Movement Visual",
     prompts: [
-      "Bitcoin price surging upward green explosion dark background cinematic dramatic",
-      "cryptocurrency price chart violent upward movement breaking resistance golden light",
-      "market structure breakout visualization glowing green ascending dark void background",
-      "price discovery zone glowing chart dark background gold particles ascending",
-      "crypto bull run visualization Bitcoin charging upward golden energy dark background",
+      `Bitcoin price surging upward green explosion dark background cinematic dramatic gold energy, ${BASE}`,
+      `cryptocurrency price chart violent upward movement breaking resistance golden light rays, ${BASE}`,
+      `bull market visualization Bitcoin charging upward golden energy dark void dramatic, ${BASE}`,
     ]
   },
   motivation: {
     label: "💪 Motivational Quote Card",
     prompts: [
-      "lone warrior standing at dawn dark mountains horizon golden light breaking through",
-      "solitary figure meditating above city lights dark atmosphere inner strength gold aura",
-      "dark dramatic sunrise lone trader silhouette charts and wealth ascending powerful",
-      "warrior mindset dark armor glowing eyes battlefield market charts background cinematic",
-      "phoenix rising from dark ashes golden light transformation powerful dramatic atmosphere",
+      `lone warrior standing at dawn dark mountains horizon golden light breaking through dramatic, ${BASE}`,
+      `solitary figure meditating above city lights dark atmosphere inner strength gold aura cinematic, ${BASE}`,
+      `phoenix rising from dark ashes golden light transformation powerful dramatic atmosphere, ${BASE}`,
+      `warrior mindset dark armor glowing eyes battlefield market charts background cinematic epic, ${BASE}`,
     ]
   },
   war_geo: {
     label: "⚔️ War/Geopolitical Visual",
     prompts: [
-      "dark geopolitical chess board world map shadows dramatic cinematic no people",
-      "global conflict visualization dark world map glowing tension lines dramatic atmosphere",
-      "dark earth from space with glowing conflict zones dramatic satellite view cinematic",
-      "geopolitical tension visualization dark stormy globe capital flows military colors",
-      "world power dynamics dark visualization chess pieces globe dramatic lighting",
+      `dark geopolitical chess board world map shadows dramatic cinematic atmospheric no people, ${BASE}`,
+      `global conflict visualization dark world map glowing tension lines dramatic atmosphere, ${BASE}`,
+      `dark earth from space glowing conflict zones dramatic satellite view cinematic, ${BASE}`,
     ]
   },
 };
 
-const BASE_NEGATIVE = "no text, no words, no letters, no numbers, no watermarks, no logos";
-const BASE_STYLE = "dark aesthetic, gold #c9a84c and deep purple #7c3aed color palette, void black background, cinematic mysterious photorealistic 8k ultra detailed";
-
-// ── Generate image prompt with Claude ────────────────────────
-async function enhancePrompt(basePrompt, customContext = "") {
-  const response = await claude.messages.create({
-    model: "claude-sonnet-4-20250514",
-    max_tokens: 150,
-    system: "You write ultra-detailed image generation prompts. Dark, cinematic, photorealistic. Under 300 chars. Never include text/words in prompts.",
-    messages: [{
-      role: "user",
-      content: `Enhance this image prompt for CIPHER brand: "${basePrompt}" ${customContext ? `Context: ${customContext}` : ""}. Make it more detailed and dramatic. Under 300 chars.`
-    }]
-  });
-  return response.content[0].text.trim();
-}
-
-// ── Generate image from Pollinations ─────────────────────────
-async function generateImage(styleKey, customContext = "") {
-  const style = STYLES[styleKey];
-  const randomPrompt = style.prompts[Math.floor(Math.random() * style.prompts.length)];
-
-  // Enhance with Claude
-  let finalPrompt;
+// ── Enhance prompt with Claude ────────────────────────────────
+async function enhancePrompt(basePrompt) {
   try {
-    finalPrompt = await enhancePrompt(randomPrompt, customContext);
+    const res = await claude.messages.create({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 120,
+      system: "You write ultra-detailed image prompts. Dark, cinematic, photorealistic. Under 250 chars. No text/words in image.",
+      messages: [{ role: "user", content: `Enhance for CIPHER dark crypto brand: "${basePrompt.substring(0, 150)}". More dramatic and detailed. Under 250 chars.` }]
+    });
+    return res.content[0].text.trim();
   } catch {
-    finalPrompt = randomPrompt;
+    return basePrompt;
   }
-
-  const fullPrompt = `${finalPrompt}, ${BASE_STYLE}, ${BASE_NEGATIVE}`;
-  const encoded = encodeURIComponent(fullPrompt);
-  const seed = Math.floor(Math.random() * 999999);
-
-  // Try different sizes for variety
-  const sizes = ["1280x720", "1024x1024", "1280x720"];
-  const size = sizes[Math.floor(Math.random() * sizes.length)];
-  const [w, h] = size.split("x");
-
-  const url = `https://image.pollinations.ai/prompt/${encoded}?width=${w}&height=${h}&nologo=true&seed=${seed}&enhance=true`;
-
-  log(`Fetching image from Pollinations: ${finalPrompt.substring(0, 60)}...`);
-  const buffer = await downloadBuffer(url, 60000);
-  log(`✅ Image downloaded (${buffer.length} bytes)`);
-  return { buffer, prompt: finalPrompt };
 }
 
-// ── Generate video using Python + ffmpeg ──────────────────────
-async function generateVideo(styleKey, customContext = "") {
-  log(`🎬 Generating video for ${styleKey}...`);
-
-  // Generate 2 images and animate between them
-  const [img1, img2] = await Promise.all([
-    generateImage(styleKey, customContext),
-    generateImage(styleKey, customContext),
-  ]);
-
-  const tmp1 = `/tmp/cipher_f1_${Date.now()}.jpg`;
-  const tmp2 = `/tmp/cipher_f2_${Date.now()}.jpg`;
-  const tmpOut = `/tmp/cipher_vid_${Date.now()}.mp4`;
-
-  fs.writeFileSync(tmp1, img1.buffer);
-  fs.writeFileSync(tmp2, img2.buffer);
-
-  // Create animated video with crossfade using ffmpeg
-  const ffmpegCmd = `ffmpeg -y \
-    -loop 1 -t 4 -i "${tmp1}" \
-    -loop 1 -t 4 -i "${tmp2}" \
-    -filter_complex "\
-      [0:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fade=t=out:st=3:d=1[v0];\
-      [1:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fade=t=in:st=0:d=1[v1];\
-      [v0][v1]concat=n=2:v=1:a=0[outv]" \
-    -map "[outv]" \
-    -c:v libx264 -pix_fmt yuv420p -crf 23 -preset fast \
-    -movflags +faststart \
-    "${tmpOut}"`;
-
-  execSync(ffmpegCmd, { timeout: 60000, stdio: "pipe" });
-
-  const videoBuffer = fs.readFileSync(tmpOut);
-
-  // Cleanup
-  [tmp1, tmp2, tmpOut].forEach(f => { try { fs.unlinkSync(f); } catch {} });
-
-  log(`✅ Video generated (${videoBuffer.length} bytes)`);
-  return { buffer: videoBuffer, prompt: img1.prompt };
-}
-
-// ══════════════════════════════════════════════════════════════
-// COMMAND HANDLERS
-// ══════════════════════════════════════════════════════════════
-
-async function handleGenerate(styleKey, type = "image", customContext = "") {
+// ── Handle generate command ───────────────────────────────────
+async function handleGenerate(styleKey, type = "image", customPrompt = null) {
   const style = STYLES[styleKey];
-  await sendMsg(`⟁ *Generating ${style.label}...*\n_This takes 20-40 seconds_`);
-  await sendTyping();
+  const label = style ? style.label : "🎨 Custom";
+
+  await sendMsg(`⟁ *Generating ${label}...*\n_Trying multiple providers if needed_`);
 
   try {
+    let prompt;
+    if (customPrompt) {
+      prompt = `${customPrompt}, ${BASE}`;
+    } else {
+      const prompts = style.prompts;
+      const base = prompts[Math.floor(Math.random() * prompts.length)];
+      prompt = await enhancePrompt(base);
+    }
+
     if (type === "video") {
       await bot.sendChatAction(CHAT_ID, "upload_video");
-      const { buffer, prompt } = await generateVideo(styleKey, customContext);
-      const caption = `🎬 *${style.label}*\n\n_⟁ CIPHER Media_`;
-      await sendVideo(buffer, caption);
-      log(`✅ Video sent for ${styleKey}`);
+      log("Generating 2 images for video...");
+      const [buf1, buf2] = await Promise.all([
+        generateImage(prompt),
+        generateImage(prompt),
+      ]);
+
+      const t1 = `/tmp/cf1_${Date.now()}.jpg`;
+      const t2 = `/tmp/cf2_${Date.now()}.jpg`;
+      const tv = `/tmp/cv_${Date.now()}.mp4`;
+
+      fs.writeFileSync(t1, buf1);
+      fs.writeFileSync(t2, buf2);
+
+      execSync(`ffmpeg -y \
+        -loop 1 -t 4 -i "${t1}" \
+        -loop 1 -t 4 -i "${t2}" \
+        -filter_complex "[0:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fade=t=out:st=3:d=1[v0];[1:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fade=t=in:st=0:d=1[v1];[v0][v1]concat=n=2:v=1:a=0[outv]" \
+        -map "[outv]" -c:v libx264 -pix_fmt yuv420p -crf 23 -preset fast -movflags +faststart "${tv}"`,
+        { timeout: 90000, stdio: "pipe" }
+      );
+
+      const vidBuf = fs.readFileSync(tv);
+      [t1, t2, tv].forEach(f => { try { fs.unlinkSync(f); } catch {} });
+
+      await sendVideo(vidBuf, `🎬 *${label}*\n\n_⟁ CIPHER Media_`);
     } else {
-      const { buffer, prompt } = await generateImage(styleKey, customContext);
-      const caption = `🎨 *${style.label}*\n\n_⟁ CIPHER Media_`;
-      await sendPhoto(buffer, caption);
-      log(`✅ Image sent for ${styleKey}`);
+      await bot.sendChatAction(CHAT_ID, "upload_photo");
+      const buffer = await generateImage(prompt);
+      await sendPhoto(buffer, `🎨 *${label}*\n\n_⟁ CIPHER Media_`);
     }
+
+    log(`✅ ${type} sent for ${styleKey}`);
   } catch (err) {
-    log(`❌ Generation failed: ${err.message}`);
-    await sendMsg(`❌ Generation failed: ${err.message}\n\nTry again — Pollinations can sometimes be slow.`);
+    log(`❌ Failed: ${err.message}`);
+    await sendMsg(`❌ *Generation failed*\n\n${err.message}\n\n_Try /status to check providers_`);
   }
 }
 
-// ── /start ────────────────────────────────────────────────────
-bot.onText(/\/start/, async () => {
-  await sendMsg(`⟁ *CIPHER MEDIA BOT*
+// ══════════════════════════════════════════════════════════════
+// COMMANDS
+// ══════════════════════════════════════════════════════════════
+
+bot.onText(/\/start/, () => sendMsg(`⟁ *CIPHER MEDIA BOT*
 _The oracle generates on command._
 
 *📸 IMAGE COMMANDS:*
@@ -261,149 +304,97 @@ _The oracle generates on command._
 /price — Price movement visual
 /motivation — Motivational quote card
 /war — War/geopolitical visual
+/random — Random style
 
 *🎬 VIDEO COMMANDS:*
-/vcypher — CIPHER brand video
-/vcrypto — Crypto market video
-/vnews — Breaking news video
-/vprice — Price movement video
-/vmotivation — Motivation video
-/vwar — War/geopolitical video
-
-*🎲 RANDOM:*
-/random — Random image, random style
-/vrandom — Random video, random style
+/vcypher /vcrypto /vnews
+/vprice /vmotivation /vwar /vrandom
 
 *🎨 CUSTOM:*
-/custom <description> — Generate custom image
-/vcustom <description> — Generate custom video
+/custom <description>
+/vcustom <description>
 
-_All images are free. Generated by Pollinations.AI._`);
-});
+*🛠️ OTHER:*
+/all — Generate all 6 styles
+/status — Check provider status`));
 
-// ── IMAGE COMMANDS ────────────────────────────────────────────
+// Image commands
 bot.onText(/\/cipher$/, () => handleGenerate("cipher_brand", "image"));
 bot.onText(/\/crypto$/, () => handleGenerate("crypto_market", "image"));
 bot.onText(/\/news$/, () => handleGenerate("breaking_news", "image"));
 bot.onText(/\/price$/, () => handleGenerate("price_animation", "image"));
 bot.onText(/\/motivation$/, () => handleGenerate("motivation", "image"));
 bot.onText(/\/war$/, () => handleGenerate("war_geo", "image"));
+bot.onText(/\/random$/, () => {
+  const key = Object.keys(STYLES)[Math.floor(Math.random() * Object.keys(STYLES).length)];
+  handleGenerate(key, "image");
+});
 
-// ── VIDEO COMMANDS ────────────────────────────────────────────
+// Video commands
 bot.onText(/\/vcypher$/, () => handleGenerate("cipher_brand", "video"));
 bot.onText(/\/vcrypto$/, () => handleGenerate("crypto_market", "video"));
 bot.onText(/\/vnews$/, () => handleGenerate("breaking_news", "video"));
 bot.onText(/\/vprice$/, () => handleGenerate("price_animation", "video"));
 bot.onText(/\/vmotivation$/, () => handleGenerate("motivation", "video"));
 bot.onText(/\/vwar$/, () => handleGenerate("war_geo", "video"));
-
-// ── RANDOM ────────────────────────────────────────────────────
-bot.onText(/\/random$/, () => {
-  const keys = Object.keys(STYLES);
-  const random = keys[Math.floor(Math.random() * keys.length)];
-  handleGenerate(random, "image");
-});
-
 bot.onText(/\/vrandom$/, () => {
-  const keys = Object.keys(STYLES);
-  const random = keys[Math.floor(Math.random() * keys.length)];
-  handleGenerate(random, "video");
+  const key = Object.keys(STYLES)[Math.floor(Math.random() * Object.keys(STYLES).length)];
+  handleGenerate(key, "video");
 });
 
-// ── CUSTOM IMAGE ──────────────────────────────────────────────
-bot.onText(/\/custom (.+)/, async (msg, match) => {
-  const description = match[1].trim();
-  if (!description) { await sendMsg("Usage: /custom <your description>"); return; }
+// Custom
+bot.onText(/\/custom (.+)/, (msg, match) => handleGenerate(null, "image", match[1].trim()));
+bot.onText(/\/vcustom (.+)/, (msg, match) => handleGenerate(null, "video", match[1].trim()));
 
-  await sendMsg(`⟁ *Generating custom image...*\n_"${description.substring(0, 60)}"_`);
-  await sendTyping();
-
-  try {
-    const fullPrompt = `${description}, ${BASE_STYLE}, ${BASE_NEGATIVE}`;
-    const encoded = encodeURIComponent(fullPrompt);
-    const seed = Math.floor(Math.random() * 999999);
-    const url = `https://image.pollinations.ai/prompt/${encoded}?width=1280&height=720&nologo=true&seed=${seed}&enhance=true`;
-    const buffer = await downloadBuffer(url, 60000);
-    await sendPhoto(buffer, `🎨 *Custom: ${description.substring(0, 50)}*\n\n_⟁ CIPHER Media_`);
-  } catch (err) {
-    await sendMsg(`❌ Failed: ${err.message}`);
-  }
-});
-
-// ── CUSTOM VIDEO ──────────────────────────────────────────────
-bot.onText(/\/vcustom (.+)/, async (msg, match) => {
-  const description = match[1].trim();
-  if (!description) { await sendMsg("Usage: /vcustom <your description>"); return; }
-
-  await sendMsg(`⟁ *Generating custom video...*\n_"${description.substring(0, 60)}"_\n_Takes 60-90 seconds_`);
-
-  try {
-    // Generate 2 images with same theme
-    const prompt = `${description}, ${BASE_STYLE}, ${BASE_NEGATIVE}`;
-    const encoded = encodeURIComponent(prompt);
-
-    const [img1Buf, img2Buf] = await Promise.all([
-      downloadBuffer(`https://image.pollinations.ai/prompt/${encoded}?width=1280&height=720&nologo=true&seed=${Math.floor(Math.random()*999999)}&enhance=true`, 60000),
-      downloadBuffer(`https://image.pollinations.ai/prompt/${encoded}?width=1280&height=720&nologo=true&seed=${Math.floor(Math.random()*999999)}&enhance=true`, 60000),
-    ]);
-
-    const tmp1 = `/tmp/cipher_c1_${Date.now()}.jpg`;
-    const tmp2 = `/tmp/cipher_c2_${Date.now()}.jpg`;
-    const tmpOut = `/tmp/cipher_cv_${Date.now()}.mp4`;
-
-    fs.writeFileSync(tmp1, img1Buf);
-    fs.writeFileSync(tmp2, img2Buf);
-
-    execSync(`ffmpeg -y \
-      -loop 1 -t 4 -i "${tmp1}" \
-      -loop 1 -t 4 -i "${tmp2}" \
-      -filter_complex "[0:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fade=t=out:st=3:d=1[v0];[1:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fade=t=in:st=0:d=1[v1];[v0][v1]concat=n=2:v=1:a=0[outv]" \
-      -map "[outv]" -c:v libx264 -pix_fmt yuv420p -crf 23 -preset fast -movflags +faststart "${tmpOut}"`,
-      { timeout: 90000, stdio: "pipe" }
-    );
-
-    const videoBuffer = fs.readFileSync(tmpOut);
-    [tmp1, tmp2, tmpOut].forEach(f => { try { fs.unlinkSync(f); } catch {} });
-
-    await sendVideo(videoBuffer, `🎬 *Custom: ${description.substring(0, 50)}*\n\n_⟁ CIPHER Media_`);
-  } catch (err) {
-    await sendMsg(`❌ Failed: ${err.message}`);
-  }
-});
-
-// ── BULK: Generate all 6 styles at once ──────────────────────
+// All styles
 bot.onText(/\/all$/, async () => {
-  await sendMsg("⟁ *Generating all 6 styles...*\n_This will take a few minutes_");
-  const keys = Object.keys(STYLES);
-  for (const key of keys) {
+  await sendMsg("⟁ *Generating all 6 styles...*");
+  for (const key of Object.keys(STYLES)) {
     await handleGenerate(key, "image");
     await new Promise(r => setTimeout(r, 3000));
   }
-  await sendMsg("✅ *All 6 styles generated!*");
+  await sendMsg("✅ *All 6 styles done!*");
 });
 
-// ── STATUS ────────────────────────────────────────────────────
+// Status - test all providers
 bot.onText(/\/status/, async () => {
-  await sendMsg(`⟁ *CIPHER MEDIA BOT — STATUS*
+  await sendMsg("⟁ *Checking all image providers...*");
+  const results = [];
 
-✅ Bot: Online
-🎨 Image engine: Pollinations.AI (free)
-🎬 Video engine: FFmpeg + Pollinations
-🤖 AI prompt enhancer: Claude
+  // Test HF
+  if (HF_TOKEN) {
+    try {
+      await generateViaHuggingFace("test dark abstract");
+      results.push("✅ Hugging Face — ONLINE");
+    } catch (e) {
+      results.push(`❌ Hugging Face — ${e.message.substring(0, 40)}`);
+    }
+  } else {
+    results.push("⚠️ Hugging Face — No HF_TOKEN set");
+  }
 
-*Available styles:*
-• CIPHER Brand Art
-• Crypto Market Visual
-• Breaking News Graphic
-• Price Movement Visual
-• Motivational Quote Card
-• War/Geopolitical Visual
+  // Test Pollinations
+  try {
+    await generateViaPollinations("test dark abstract", "flux");
+    results.push("✅ Pollinations — ONLINE");
+  } catch (e) {
+    results.push(`❌ Pollinations — ${e.message.substring(0, 40)}`);
+  }
 
-_All systems operational._`);
+  // Test DeepAI
+  try {
+    await generateViaDeepAI("test dark abstract");
+    results.push("✅ DeepAI — ONLINE");
+  } catch (e) {
+    results.push(`❌ DeepAI — ${e.message.substring(0, 40)}`);
+  }
+
+  await sendMsg(`⟁ *PROVIDER STATUS*\n\n${results.join("\n")}\n\n_Bot uses first available provider_`);
 });
 
 // ─── STARTUP ──────────────────────────────────────────────────
 log("⟁ CIPHER Media Bot starting...");
-bot.sendMessage(CHAT_ID, "⟁ *CIPHER MEDIA BOT ONLINE*\n\nSend /start to see all commands.", { parse_mode: "Markdown" }).catch(() => {});
-log("✅ CIPHER Media Bot is live. Send /start to begin.");
+log(`HF_TOKEN: ${HF_TOKEN ? "✅ Set" : "⚠️ Not set (will use fallbacks)"}`);
+bot.sendMessage(CHAT_ID, "⟁ *CIPHER MEDIA BOT ONLINE*\n\nSend /start to see all commands.\nSend /status to check which image providers are working.", { parse_mode: "Markdown" }).catch(() => {});
+log("✅ Ready.");
 setInterval(() => {}, 1 << 30);
