@@ -1,0 +1,17 @@
+{
+  "name": "cipher-media-bot",
+  "version": "1.0.0",
+  "description": "CIPHER — On-Demand Image & Video Generator",
+  "type": "module",
+  "main": "media-bot.js",
+  "scripts": {
+    "start": "node media-bot.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.27.0",
+    "node-telegram-bot-api": "^0.66.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
